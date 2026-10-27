@@ -100,6 +100,31 @@ function toTodoResponse(todo: TodoWithCategory) {
   };
 }
 
+// SQLite stores the Priority enum as TEXT, so ordering by `priority` in the
+// database sorts alphabetically (HIGH, LOW, MEDIUM) instead of the spec's
+// enum order (HIGH, MEDIUM, LOW for desc). Priority results are therefore
+// sorted in memory by explicit rank (see compareTodosByPriority); do not
+// reintroduce a database `orderBy: { priority }`.
+const PRIORITY_RANK: Record<Priority, number> = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+
+function compareTodosByPriority(
+  a: TodoWithCategory,
+  b: TodoWithCategory,
+  order: "asc" | "desc",
+): number {
+  const rankDiff = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+  if (rankDiff !== 0) {
+    // Rank 0 (HIGH) first for desc, last for asc.
+    return order === "desc" ? rankDiff : -rankDiff;
+  }
+  // Deterministic tie-break: newest first, then highest id first.
+  const createdDiff = b.createdAt.getTime() - a.createdAt.getTime();
+  if (createdDiff !== 0) {
+    return createdDiff;
+  }
+  return b.id - a.id;
+}
+
 function parseTodoId(req: AuthenticatedRequest): number {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
@@ -307,24 +332,39 @@ router.get(
       where.categoryId = categoryId;
     }
     if (query.search !== undefined) {
+      // No insensitive mode here - Prisma's SQLite StringFilter has no mode
+      // property (PostgreSQL-only; TS2353). Plain `contains` on SQLite uses
+      // LIKE, which is case-insensitive for ASCII, so search stays
+      // case-insensitive without it.
       where.OR = [
-        { title: { contains: query.search, mode: "insensitive" } },
-        { description: { contains: query.search, mode: "insensitive" } },
+        { title: { contains: query.search } },
+        { description: { contains: query.search } },
       ];
     }
 
-    const orderBy = { [sortBy]: order } as Prisma.TodoOrderByWithRelationInput;
+    const total = await prisma.todo.count({ where });
 
-    const [total, todos] = await Promise.all([
-      prisma.todo.count({ where }),
-      prisma.todo.findMany({
+    let todos: TodoWithCategory[];
+    if (sortBy === "priority") {
+      // In-memory sort by enum rank (see PRIORITY_RANK). `total` is the full
+      // filtered count from above; pagination is applied to the sorted
+      // result below, so page/limit/total stay correct.
+      const all = await prisma.todo.findMany({
+        where,
+        include: { category: true },
+      });
+      all.sort((a, b) => compareTodosByPriority(a, b, order));
+      todos = all.slice((page - 1) * limit, (page - 1) * limit + limit);
+    } else {
+      const orderBy = { [sortBy]: order } as Prisma.TodoOrderByWithRelationInput;
+      todos = await prisma.todo.findMany({
         where,
         include: { category: true },
         orderBy,
         skip: (page - 1) * limit,
         take: limit,
-      }),
-    ]);
+      });
+    }
 
     res.json({
       items: todos.map(toTodoResponse),

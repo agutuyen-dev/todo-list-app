@@ -132,7 +132,11 @@ router.get(
 
     const where: Prisma.CategoryWhereInput = { userId };
     if (query.search !== undefined) {
-      where.name = { contains: query.search, mode: "insensitive" };
+      // No insensitive mode here - Prisma's SQLite StringFilter has no mode
+      // property (PostgreSQL-only; TS2353). Plain `contains` on SQLite uses
+      // LIKE, which is case-insensitive for ASCII, so search stays
+      // case-insensitive without it.
+      where.name = { contains: query.search };
     }
 
     const [total, categories] = await Promise.all([
