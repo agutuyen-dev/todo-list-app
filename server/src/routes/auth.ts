@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response, Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { ApiError } from "../utils/errors";
 
@@ -15,6 +16,10 @@ const router = Router();
 //   INVALID_CREDENTIALS, so the response never reveals which one was wrong.
 // - Emails are normalised to lowercase before storage/lookup.
 const MIN_PASSWORD_LENGTH = 8;
+// bcrypt silently truncates passwords longer than 72 bytes, so a longer
+// password would create an account the user could never log into with
+// the full password. Reject such passwords instead.
+const MAX_PASSWORD_BYTES = 72;
 const JWT_EXPIRES_IN = "7d";
 
 function publicUser(user: { id: number; email: string; name: string | null }) {
@@ -50,6 +55,11 @@ router.post("/register", async (req: Request, res: Response, next: NextFunction)
         field: "password",
         message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
       });
+    } else if (Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES) {
+      details.push({
+        field: "password",
+        message: `Password must be at most ${MAX_PASSWORD_BYTES} bytes`,
+      });
     }
     if (name !== undefined && typeof name !== "string") {
       details.push({ field: "name", message: "Name must be a string" });
@@ -65,13 +75,24 @@ router.post("/register", async (req: Request, res: Response, next: NextFunction)
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: {
-        email: normalizedEmail,
-        passwordHash,
-        name: name?.trim() || null,
-      },
-    });
+    let user;
+    try {
+      user = await prisma.user.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          name: name?.trim() || null,
+        },
+      });
+    } catch (err) {
+      // Two concurrent register requests can both pass the findUnique
+      // check above; the second one then fails on the unique constraint.
+      // Report that as a duplicate email, not a 500.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new ApiError(400, "EMAIL_ALREADY_EXISTS", "Email is already registered");
+      }
+      throw err;
+    }
 
     return res.status(201).json({ token: signToken(user), user: publicUser(user) });
   } catch (err) {
@@ -83,8 +104,18 @@ router.post("/register", async (req: Request, res: Response, next: NextFunction)
 router.post("/login", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body ?? {};
-    if (typeof email !== "string" || typeof password !== "string") {
-      throw new ApiError(401, "INVALID_CREDENTIALS", "Email or password is incorrect");
+    const details: { field: string; message: string }[] = [];
+    // Malformed login data is a client error (400), not a failed login:
+    // 401 INVALID_CREDENTIALS is only for well-formed credentials that
+    // do not match an account.
+    if (typeof email !== "string" || !isValidEmail(email.trim())) {
+      details.push({ field: "email", message: "Email is not valid" });
+    }
+    if (typeof password !== "string" || password.length === 0) {
+      details.push({ field: "password", message: "Password is required" });
+    }
+    if (details.length > 0) {
+      throw new ApiError(400, "VALIDATION_ERROR", "Invalid data", details);
     }
 
     const user = await prisma.user.findUnique({
